@@ -1,6 +1,5 @@
 gradio
-transformers
-torch
+groq
 duckduckgo_search
 pandas
 beautifulsoup4
