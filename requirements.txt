@@ -3,3 +3,5 @@ transformers
 torch
 duckduckgo_search
 pandas
+beautifulsoup4
+requests
