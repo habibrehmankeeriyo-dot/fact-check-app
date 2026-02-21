@@ -3,89 +3,101 @@ import os
 import pandas as pd
 from groq import Groq
 from duckduckgo_search import DDGS
+from newspaper import Article
 
+# Initialize Groq
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-def advanced_fact_check(claim, history):
-    if not claim.strip():
-        return "Please enter a claim.", [], pd.DataFrame(history)
+def process_input(user_input):
+    """Detects if input is a URL or Text and extracts content."""
+    if user_input.startswith(("http://", "https://")):
+        try:
+            article = Article(user_input)
+            article.download()
+            article.parse()
+            return f"NEWS ARTICLE: {article.title}\n\n{article.text[:1500]}"
+        except:
+            return "Error: Could not read this URL. Please check the link."
+    return user_input
 
-    # 1. Fetch search results with URLs
+def advanced_audit(claim_or_url, history):
+    # 1. Pre-process Input
+    content = process_input(claim_or_url)
+    if "Error" in content: return content, [], pd.DataFrame(history), 0
+    
+    # 2. Search for Live Context
     sources = []
     with DDGS() as ddgs:
-        results = list(ddgs.text(claim, max_results=4))
-        search_text = ""
-        for r in results:
-            search_text += f"Source: {r['title']} - {r['body']}\n"
-            sources.append([r['title'], r['href']])
-    
-    # 2. Reasoning with Llama 3.3
+        # We search the first 100 characters of the content to find related news
+        search_query = claim_or_url if len(claim_or_url) < 100 else content[:100]
+        results = list(ddgs.text(search_query, max_results=4))
+        search_text = "\n".join([f"Source: {r['title']} - {r['body']}" for r in results])
+        sources = [[r['title'], r['href']] for r in results]
+
+    # 3. Groq Reasoning (Llama 3.3 70B)
     prompt = f"""
-    Analyze this claim based on the provided evidence. 
-    1. Direct Verdict (TRUE/FALSE/UNCERTAIN)
-    2. One-sentence reasoning.
-    3. Key evidence summary.
-    
-    Claim: {claim}
-    Evidence: {search_text}
+    SYSTEM: You are an elite AI fact-checker. 
+    TASK: Analyze the 'Content' against the 'Web Evidence'.
+    FORMAT:
+    ### VERDICT: [TRUE | FALSE | MISLEADING | UNCERTAIN]
+    ### CONFIDENCE: [0-100]%
+    ### SUMMARY: [Max 2 sentences]
+    ### ANALYSIS: [Bullet points of key facts]
+
+    Content to Check: {content}
+    Web Evidence: {search_text}
     """
 
-    chat = client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": "You are a senior investigative journalist. Be precise and skeptical."},
-            {"role": "user", "content": prompt}
-        ],
+    response = client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
         model="llama-3.3-70b-versatile",
         temperature=0.1
-    )
-    
-    analysis = chat.choices[0].message.content
-    verdict = "TRUE" if "TRUE" in analysis.upper() else "FALSE" if "FALSE" in analysis.upper() else "UNCERTAIN"
-    
-    # 3. Update History
-    history.append({"Claim": claim[:30] + "...", "Verdict": verdict})
-    
-    return analysis, sources, pd.DataFrame(history)
+    ).choices[0].message.content
 
-# --- Pro UI Layout ---
-with gr.Blocks(theme=gr.themes.Ocean()) as demo:
-    gr.Markdown("# 🛡️ Investigative AI Fact-Checker")
+    # 4. UI Updates
+    # Logic to extract the percentage for the gauge
+    try:
+        conf_score = int(response.split("CONFIDENCE:")[1].split("%")[0].strip())
+    except:
+        conf_score = 50
+
+    history.append({"Input": claim_or_url[:30]+"...", "Score": f"{conf_score}%"})
     
+    return response, sources, pd.DataFrame(history), conf_score
+
+# --- Advanced Dashboard UI ---
+with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue")) as demo:
+    gr.Markdown("# 🛡️ News Audit & Fact-Check Dashboard")
     state_history = gr.State([])
 
+    with gr.Row():
+        with gr.Column(scale=2):
+            input_data = gr.Textbox(
+                label="Paste News URL or Text Claim", 
+                placeholder="https://bbc.com/news... OR 'The moon is made of cheese'",
+                lines=3
+            )
+            run_btn = gr.Button("🚀 Start Deep Audit", variant="primary")
+        
+        with gr.Column(scale=1):
+            # Visual Gauge for Confidence
+            gauge = gr.Slider(0, 100, label="AI Confidence Level", interactive=False)
+            status_light = gr.Markdown("🟢 **System Online** | API Connected")
+
     with gr.Tabs():
-        with gr.TabItem("🔍 Analyze"):
-            with gr.Row():
-                with gr.Column(scale=3):
-                    claim_input = gr.Textbox(label="Claim", placeholder="Enter a statement to verify...")
-                    check_btn = gr.Button("Run Audit", variant="primary")
-                with gr.Column(scale=1):
-                    # Shows a color-coded label
-                    verdict_label = gr.Label(label="Quick Verdict")
+        with gr.Tab("📋 Audit Report"):
+            report_out = gr.Markdown("Waiting for input...")
+        
+        with gr.Tab("🔗 Verified Sources"):
+            source_out = gr.Dataframe(headers=["Title", "Source URL"], interactive=False)
             
-            output_report = gr.Markdown(label="Full Investigation Report")
-            
-        with gr.TabItem("🌐 Sources"):
-            gr.Markdown("### Evidence gathered from the web:")
-            source_display = gr.Dataframe(headers=["Title", "URL"], interactive=False)
+        with gr.Tab("📜 Session History"):
+            log_out = gr.Dataframe(headers=["Input", "Score"])
 
-        with gr.TabItem("📊 Session Log"):
-            history_table = gr.Dataframe(headers=["Claim", "Verdict"])
-
-    # Connection logic
-    def update_label(analysis):
-        if "TRUE" in analysis.upper(): return "TRUE"
-        if "FALSE" in analysis.upper(): return "FALSE"
-        return "UNCERTAIN"
-
-    check_btn.click(
-        fn=advanced_fact_check, 
-        inputs=[claim_input, state_history], 
-        outputs=[output_report, source_display, history_table]
-    ).then(
-        fn=lambda x: x.split('\n')[0], # Extracting first line for label
-        inputs=[output_report],
-        outputs=[verdict_label]
+    run_btn.click(
+        fn=advanced_audit,
+        inputs=[input_data, state_history],
+        outputs=[report_out, source_out, log_out, gauge]
     )
 
 if __name__ == "__main__":
