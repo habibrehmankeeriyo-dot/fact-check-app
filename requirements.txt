@@ -2,3 +2,4 @@ gradio
 transformers
 torch
 duckduckgo_search
+pandas
